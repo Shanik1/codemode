@@ -75,6 +75,8 @@ Name each input as the provider's own reference names that parameter, in camelCa
 
 Return plain data. Results are converted to JSON before they reach the caller. Throw an `Error` to fail the call; the caller receives its message.
 
+Return a file's path instead of large or binary content. `writeOutputFile(prefix, extension, data, ctx.outputDir)` from `@shiftlabs/codemode` writes a new file that only the user can read and answers its path.
+
 `execute` receives a context as its second argument:
 
 | Property | Contents |
@@ -83,6 +85,7 @@ Return plain data. Results are converted to JSON before they reach the caller. T
 | `ctx.context` | A value the host passed to `execute()` for this run, invisible to the calling code |
 | `ctx.credentials` | The host's request signer, when the host keeps credentials outside this process |
 | `ctx.signal` | An `AbortSignal` that fires when the run that made the call ends. Pass it to work that should stop with the run |
+| `ctx.outputDir` | Where the host keeps output files, when it names a place. Write large or binary output there with `writeOutputFile()` and return the path |
 | `ctx.log` | `info`, `warn`, and `error`, prefixed with the plugin name |
 | `ctx.updateConnection(patch)` | Persists a change to the connection's config through the host |
 
@@ -145,6 +148,35 @@ export default function orders(rl: CodemodePluginAPI) {
 The declaration states what the secret is, how it is placed, and the HTTPS targets that may receive it. Codemode refuses any request outside those targets. A host that keeps credentials elsewhere signs the same requests without the plugin changing.
 
 [Credentials](credentials.md) covers every kind of declaration, including OAuth, AWS, and cookie sessions. [Credentials Reference](credentials-reference.md) lists the request and error helpers.
+
+## Run a shell command
+
+A plugin that runs commands uses `runShell` from `@shiftlabs/codemode/utils/cli`. It starts one new process per call and ends that process, and everything it started, when the call times out or is aborted:
+
+```typescript
+import { runShell } from "@shiftlabs/codemode/utils/cli";
+
+const result = await runShell(
+  { program: "/bin/bash", args: ["-c"] },
+  "git status --short",
+  { cwd: repo, timeoutMs: 30_000, signal: ctx.signal, outputDir: ctx.outputDir },
+);
+// { output: " M README.md\n", exitCode: 0, truncated: false, wallTimeMs: 12 }
+```
+
+Pass `ctx.signal` so that a command ends with the run that started it, and `ctx.outputDir` so that output past the limit is kept where the host keeps its output files.
+
+| Outcome | Result |
+|---|---|
+| The script exits, with any exit code | Resolves with `output`, `exitCode`, `truncated`, and `wallTimeMs` |
+| A signal ends the shell | Resolves with `exitCode` 128 plus the signal's number |
+| The program cannot start, or `cwd` does not exist | Rejects with a `ShellError` whose `code` is `spawn_failed` |
+| The script outlives `timeoutMs` | Rejects with `code` `timed_out`. `output` holds what it wrote |
+| `signal` aborts | Rejects with `code` `aborted` |
+
+`output` is stdout and stderr together. They are two pipes, so a line of one may land before an earlier line of the other. Output past `maxOutputBytes`, 1 MiB by default, keeps its start and end around a marker, and the whole of it is written to a file named by `fullOutputPath` that only your account can read. The file is in `outputDir`, or in the system's temporary directory.
+
+The command inherits the environment of the codemode process, with `env` added to it. It runs in a process group of its own, and codemode ends that group when its own process exits or is interrupted. Check a failure with `isShellError()`.
 
 ## Understand how plugins load
 

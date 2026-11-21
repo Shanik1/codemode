@@ -8,10 +8,8 @@
  * send_file/attachment tool. Plugins load in-process via jiti, so node:fs is
  * available (same pattern as googleDrive/googleSlides).
  */
-import { randomUUID } from "node:crypto";
-import { writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { basename, extname, join } from "node:path";
+import { basename, extname } from "node:path";
+import { writeOutputFile } from "@shiftlabs/codemode";
 import { readLocalFile } from "./localFile.js";
 
 const MIME_EXT: Record<string, string> = {
@@ -45,9 +43,24 @@ export interface SavedMedia {
   byteLength: number;
 }
 
+/** What every media action says of its `saveDir` input. */
+export const SAVE_DIR_DESCRIPTION =
+  "Existing directory to write the file(s) into. Empty or omitted uses the host's output directory, else the system's temporary directory.";
+
 /**
- * Write media bytes with a unique name in `saveDir` (or the OS temp dir).
- * Exclusive creation prevents overwrites and following a pre-existing file symlink.
+ * Where an action writes its media: the directory its caller asked for,
+ * else the one the host keeps output files in.
+ */
+export function mediaDir(
+  asked: string | undefined,
+  ctx: { outputDir?: string },
+): string | undefined {
+  return (typeof asked === "string" && asked.trim()) || ctx.outputDir;
+}
+
+/**
+ * Write media bytes to an output file of their own in `saveDir`, which an
+ * action takes from `mediaDir()`.
  */
 export function writeMediaFile(opts: {
   bytes: Uint8Array;
@@ -58,16 +71,15 @@ export function writeMediaFile(opts: {
   stamp?: number;
 }): SavedMedia {
   const mimeType = opts.mimeType ?? "image/png";
-  const dir =
-    (typeof opts.saveDir === "string" && opts.saveDir.trim()) || tmpdir();
   const stamp = opts.stamp ?? Date.now();
   if (!/^[\w-]+$/.test(opts.provider))
     throw new Error("invalid media provider name");
-  const path = join(
-    dir,
-    `${opts.provider}-${stamp}-${opts.index}-${randomUUID()}.${extForMime(mimeType)}`,
+  const path = writeOutputFile(
+    `${opts.provider}-${stamp}-${opts.index}`,
+    `.${extForMime(mimeType)}`,
+    opts.bytes,
+    opts.saveDir || undefined,
   );
-  writeFileSync(path, opts.bytes, { flag: "wx", mode: 0o600 });
   return { path, mimeType, byteLength: opts.bytes.byteLength };
 }
 
