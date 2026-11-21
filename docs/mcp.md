@@ -282,8 +282,8 @@ await mcp.close();
 |---|---|
 | `load({ connect?, reservedNames?, context? })` | `{ plugins, problems }`: one plugin per enabled server. `connect: false` never connects, and a server with no cached list then loads with no actions |
 | `list({ context? })` | Every configured server, without connecting |
-| `status(name?)` | Connects and reports each server's state, tool count, and error |
-| `refresh(name?)` | Reads tool lists again and returns the servers that changed |
+| `status(name?)` | Connects and reports each server's state, the number of tools its entry loads, and its error |
+| `refresh(name?)` | Reads tool lists again. `{ refreshed, changed, problems }`: the servers read, those whose tools changed, and one problem per server that could not be read |
 | `add(name, entry, { scope? })` | Records a server. A name the scope already defines is refused |
 | `remove(name, { scope? })` | Removes a server, its cached list, and its sessions |
 | `oauth(name, { redirectUri })` | The server's endpoints as an OAuth2 definition and the client to sign in as |
@@ -307,7 +307,7 @@ Failures the manager raises are `McpServerError` values with a `code`, such as `
 | `signInOverHttp` | `loopback` | `never` refuses sign-in to a server on this machine over HTTP, for a host that does not run on the person's own machine |
 | `signInHint` | `codemode auth <server>` | How the host tells a person to sign in |
 | `idleMs`, `maxSessions` | 5 minutes, 64 | When an unused session is closed |
-| `connectTimeoutMs`, `retryFailedAfterMs` | 10 seconds, 1 minute | How long `load()` waits for a server, and how long it leaves an unreachable one alone |
+| `connectTimeoutMs`, `retryFailedAfterMs` | 10 seconds, 1 minute | How long the manager waits for a server to connect, and how long `load()` leaves an unreachable one alone |
 | `client` | `codemode` and its version | How codemode names itself to servers |
 | `onEvent` | None | Receives session states, changed tool lists, server log messages, stderr, progress, and faults that no call rejects with, such as a message from the server that is not JSON-RPC |
 

@@ -35,6 +35,7 @@ import {
 } from "./config.js";
 import { isMcpServerError, McpServerError } from "./errors.js";
 import {
+  loadedTools,
   type McpServerCalls,
   mcpOwner,
   serverPlugin,
@@ -135,7 +136,7 @@ export interface McpManagerOptions {
    * machine is not the person's own. Default: `loopback`.
    */
   signInOverHttp?: McpSignInOverHttp;
-  /** How long `load()` and `status()` wait for a server. Default: 10 seconds. */
+  /** How long `load()`, `status()` and `refresh()` wait for a server to connect. Default: 10 seconds. */
   connectTimeoutMs?: number;
   /**
    * How long `load()` leaves a server alone after it could not be reached,
@@ -179,14 +180,24 @@ export interface McpServerInfo {
   enabled: boolean;
   /** The URL, or the command and its arguments. */
   target: string;
-  /** Tools in the cached snapshot, when there is one for this entry. */
+  /** Tools the entry loads from the cached snapshot, when there is one for it. */
   cachedTools?: number;
 }
 
 export interface McpServerStatus extends McpServerInfo {
   state: McpSessionState | "disabled";
+  /** Tools the entry loads from the list the server answered with. */
   tools?: number;
   error?: string;
+}
+
+export interface McpRefreshResult {
+  /** The servers whose tool lists were read. */
+  refreshed: string[];
+  /** Those of them whose tools changed. */
+  changed: string[];
+  /** One per server that could not be read. */
+  problems: McpProblem[];
 }
 
 const require = createRequire(import.meta.url);
@@ -392,7 +403,11 @@ export class McpManager {
             false,
             whose.resolved,
           );
-          return { ...info, state: "connected", tools: report.tools.length };
+          return {
+            ...info,
+            state: "connected",
+            tools: loadedTools(server, report.tools).length,
+          };
         } catch (error) {
           const needsSignIn =
             isMcpServerError(error) && error.code === "reconnect_required";
@@ -408,22 +423,39 @@ export class McpManager {
 
   /**
    * Read tool lists again from each enabled server, or the one named, and
-   * replace their snapshots. Answers the servers that changed.
+   * replace their snapshots. A server that cannot be read is a problem, and
+   * the others are read all the same.
    */
   async refresh(
     name?: string,
     options: { context?: unknown } = {},
-  ): Promise<string[]> {
-    const changed: string[] = [];
-    const listener = (server: string) => changed.push(server);
+  ): Promise<McpRefreshResult> {
+    const servers = (await this.selected(name)).filter(
+      (server) => server.enabled,
+    );
+    const heard = new Set<string>();
+    const listener = (server: string) => heard.add(server);
     this.changeListeners.add(listener);
     try {
-      for (const server of await this.selected(name))
-        if (server.enabled) await this.report(server, options.context, true);
+      const failures = await Promise.all(
+        servers.map((server) =>
+          this.report(server, options.context, true).then(
+            () => undefined,
+            (error) => this.problem(server, error),
+          ),
+        ),
+      );
+      const refreshed = servers
+        .filter((_server, index) => !failures[index])
+        .map((server) => server.name);
+      return {
+        refreshed,
+        changed: refreshed.filter((server) => heard.has(server)),
+        problems: failures.filter((failure) => !!failure),
+      };
     } finally {
       this.changeListeners.delete(listener);
     }
-    return changed;
   }
 
   /** Record a server. A name the scope already defines is refused, not replaced. */
@@ -487,9 +519,9 @@ export class McpManager {
    * and the client to sign in as. That is the one the entry names, else the
    * host's metadata document, else one registered with `redirectUri`. Run
    * the consent with the setup's own `redirectUri` and codemode's OAuth
-   * runtime
-   * (`runOAuth`, or `buildOAuth2AuthorizationUrl` and `exchangeOAuth2Code`)
-   * and store `mcpOAuthConnection(setup, tokens)` in the server's connection.
+   * runtime (`runOAuth`, or `buildOAuth2AuthorizationUrl` and
+   * `exchangeOAuth2Code`), and store `mcpOAuthConnection(setup, tokens)` in
+   * the server's connection.
    */
   async oauth(
     name: string,
@@ -691,7 +723,9 @@ export class McpManager {
       transport: server.kind,
       enabled: server.enabled,
       target: targetOf(server),
-      ...(snapshot ? { cachedTools: snapshot.tools.length } : {}),
+      ...(snapshot
+        ? { cachedTools: loadedTools(server, snapshot.tools).length }
+        : {}),
     };
   }
 
