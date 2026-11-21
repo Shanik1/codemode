@@ -1040,6 +1040,50 @@ export class CredentialTransport {
     return outgoing.url.toString();
   }
 
+  /**
+   * The bearer token of an `oauth2` method's grant, renewed first when it is
+   * stale. For trusted host code whose protocol client sends its own
+   * requests, such as a streaming one that `request` cannot carry; a plugin
+   * is never handed a token. `rejected` is a token this method returned that
+   * the provider refused: a grant still holding it is renewed, and one
+   * another caller renewed meanwhile is kept.
+   */
+  async accessToken(
+    selection: CredentialBinding,
+    options: { rejected?: string } = {},
+  ): Promise<string> {
+    const binding = pinBinding(selection);
+    const method = this.registry.select(binding.type, binding.method);
+    if (method.authentication.kind !== "oauth2")
+      throw new AuthError("unsupported_operation");
+    const grant = await this.currentGrant(
+      binding,
+      method,
+      await this.read(binding, method),
+      options.rejected,
+    );
+    return secret(grant?.tokens.accessToken);
+  }
+
+  /**
+   * An `oauth2` method's grant as `config` holds it, renewed first when it
+   * is stale, or when it still holds `rejected`, a token the provider
+   * refused.
+   */
+  private async currentGrant(
+    binding: CredentialBinding,
+    method: CredentialMethod,
+    config: Readonly<Record<string, unknown>>,
+    rejected?: string,
+  ): Promise<OAuthGrant | undefined> {
+    const grant = grantFrom(method, config);
+    const refused =
+      rejected !== undefined && grant?.tokens.accessToken === rejected;
+    return refused || !fresh(grant)
+      ? this.renew(binding, method, grant?.revision, refused)
+      : grant;
+  }
+
   /** Only a declared read-only probe runs. Results never contain provider text or secrets. */
   async probe(binding: CredentialBinding): Promise<CredentialProbeResult> {
     const probe = this.registry.select(binding.type, binding.method).probe;
@@ -1099,9 +1143,7 @@ export class CredentialTransport {
           target,
         ),
       };
-    let grant = grantFrom(method, config);
-    if (!fresh(grant))
-      grant = await this.renew(binding, method, grant?.revision);
+    const grant = await this.currentGrant(binding, method, config);
     return { sign: bearer(secret(grant?.tokens.accessToken)), grant };
   }
 }

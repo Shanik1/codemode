@@ -1,11 +1,12 @@
 import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
-import { findConfigDir, loadConfig } from "../config/loader.js";
+import { configPath, loadConfig } from "../config/loader.js";
 import { FileConnectionProvider } from "../connections/file.js";
 import { ExecutionEngine } from "../core/engine.js";
-import { loadAllPlugins } from "../plugin/loader.js";
+import type { McpManager } from "../mcp/manager.js";
+import { enabledBuiltins, loadAllPlugins } from "../plugin/loader.js";
 import { registry } from "../plugin/registry.js";
 import { printError, printJson } from "../utils/output.js";
+import { withCliMcp } from "./mcp.js";
 import { cliPackageManager, temporarySources } from "./packages.js";
 
 export async function exec(
@@ -17,19 +18,6 @@ export async function exec(
     packages?: string[];
   },
 ): Promise<void> {
-  const config = loadConfig();
-  await loadAllPlugins({
-    builtinAllowlist: new Set(config.connections.map((c) => c.plugin)),
-    packages: cliPackageManager({ quiet: options.quiet || options.json }),
-    temporaryPackages: temporarySources(options.packages),
-  });
-  const configDir = findConfigDir() ?? join(process.cwd(), ".codemode");
-  const engine = new ExecutionEngine(registry, config, {
-    connectionProvider: new FileConnectionProvider(
-      join(configDir, "config.json"),
-    ),
-  });
-
   if (options.file) {
     if (!existsSync(code)) {
       printError(`File not found: ${code}`);
@@ -38,7 +26,31 @@ export async function exec(
     code = readFileSync(code, "utf-8");
   }
 
+  const config = loadConfig();
+  const succeeded = await withCliMcp((mcp) => run(code, config, mcp, options));
+  // The status is set, not the process ended: output still drains.
+  if (!succeeded) process.exitCode = 1;
+}
+
+/** Runs the code and prints its outcome. Answers whether it succeeded. */
+async function run(
+  code: string,
+  config: ReturnType<typeof loadConfig>,
+  mcp: McpManager,
+  options: { json?: boolean; quiet?: boolean; packages?: string[] },
+): Promise<boolean> {
+  await loadAllPlugins({
+    builtinAllowlist: enabledBuiltins(config.connections),
+    packages: cliPackageManager({ quiet: options.quiet || options.json }),
+    temporaryPackages: temporarySources(options.packages),
+    mcp,
+  });
+  const engine = new ExecutionEngine(registry, config, {
+    connectionProvider: new FileConnectionProvider(configPath()),
+  });
+
   const result = await engine.execute(code);
+  engine.dispose();
 
   if (result.error) {
     if (options.json) {
@@ -49,7 +61,7 @@ export async function exec(
       }
       printError(result.error);
     }
-    process.exit(1);
+    return false;
   }
 
   if (options.json) {
@@ -66,4 +78,5 @@ export async function exec(
       );
     }
   }
+  return true;
 }

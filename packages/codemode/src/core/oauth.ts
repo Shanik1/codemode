@@ -36,6 +36,7 @@ import {
   buildOAuth2AuthorizationUrl,
   exchangeOAuth2Code,
 } from "../auth/oauth2.js";
+import { isLoopbackHost } from "../auth/token.js";
 import type { OAuth2Definition, OAuthTokens } from "../auth/types.js";
 import type { OAuthConfig } from "../plugin/types.js";
 import { environment } from "../utils/deprecation.js";
@@ -94,7 +95,7 @@ export function oauthCallback(config: OAuthConfig): Callback {
   const port = Number(url.port);
   if (
     url.protocol !== "http:" ||
-    !["localhost", "127.0.0.1", "[::1]"].includes(url.hostname) ||
+    !isLoopbackHost(url.hostname) ||
     !Number.isInteger(port) ||
     port <= 0 ||
     url.username ||
@@ -120,6 +121,13 @@ export interface RunOAuthOptions {
   openBrowser?: (url: string) => void | Promise<void>;
   /** Maximum wait for browser consent. Defaults to five minutes. */
   callbackTimeoutMs?: number;
+  /**
+   * The authorization server's issuer, compared with the `iss` the callback
+   * carries (RFC 9207): a different one is a response meant for another
+   * server and is refused. `required` refuses a callback with no `iss`, for
+   * a server that says it always sends one.
+   */
+  issuer?: { value: string; required?: boolean };
 }
 
 export interface BuildAuthUrlOptions {
@@ -253,6 +261,7 @@ export async function runOAuth(
     onAuthUrl,
     openBrowser = defaultOpenBrowser,
     callbackTimeoutMs = 300_000,
+    issuer,
   } = options;
   const callback = oauthCallback(flowConfig);
   const redirectUri = callback.uri;
@@ -276,6 +285,7 @@ export async function runOAuth(
       if (!signal.aborted) await openBrowser(authUrl);
     },
     callbackTimeoutMs,
+    issuer,
   );
   return exchangeAuthCode(flowConfig, {
     clientId,
@@ -289,15 +299,24 @@ export async function runOAuth(
 
 // ─── Local callback server ───────────────────────────────────────
 
+/**
+ * Stop listening and drop every connection. `close()` alone waits for each
+ * one, and a browser keeps a spare connection open (a preconnect, an idle
+ * keep-alive socket) for minutes, which would hold the process open.
+ */
+function shut(servers: Server[]): void {
+  for (const server of servers) {
+    server.close();
+    server.closeAllConnections();
+  }
+}
+
 function listenLoopback(
   port: number,
   handler: (req: IncomingMessage, res: ServerResponse) => void,
   onError: () => void,
 ): Promise<Server[]> {
   const servers: Server[] = [];
-  const close = () => {
-    for (const server of servers) server.close();
-  };
   const listen = (host: string) =>
     new Promise<void>((resolve, reject) => {
       const server = createServer(handler);
@@ -316,7 +335,7 @@ function listenLoopback(
       } catch (error) {
         const code = (error as NodeJS.ErrnoException).code ?? "";
         if (host !== LOOPBACK_HOSTS[0] && IPV6_UNAVAILABLE.has(code)) continue;
-        close();
+        shut(servers);
         throw error;
       }
     }
@@ -329,6 +348,7 @@ function captureCode(
   expectedState: string,
   onReady: (signal: AbortSignal) => Promise<void>,
   timeoutMs: number,
+  issuer?: RunOAuthOptions["issuer"],
 ): Promise<{ code: string }> {
   if (
     !Number.isInteger(timeoutMs) ||
@@ -340,11 +360,16 @@ function captureCode(
   return new Promise((resolve, reject) => {
     const lifecycle = new AbortController();
     let servers: Server[] = [];
-    const finish = (result: { code: string } | Error) => {
+    /** `answered` is the response that ends the flow; it is written out before the listener shuts. */
+    const finish = (
+      result: { code: string } | Error,
+      answered?: ServerResponse,
+    ) => {
       if (lifecycle.signal.aborted) return;
       lifecycle.abort();
       clearTimeout(timer);
-      for (const server of servers) server.close();
+      if (answered) answered.once("close", () => shut(servers));
+      else shut(servers);
       if (result instanceof Error) reject(result);
       else resolve(result);
     };
@@ -371,9 +396,24 @@ function captureCode(
         res.writeHead(400).end("State mismatch");
         return;
       }
+      if (issuer) {
+        const sent = url.searchParams.getAll("iss");
+        if (
+          sent.length > 1 ||
+          (sent.length === 1 && sent[0] !== issuer.value) ||
+          (sent.length === 0 && issuer.required)
+        ) {
+          res.writeHead(400).end("Issuer mismatch. You can close this tab.");
+          finish(
+            new Error("OAuth: the response came from another issuer"),
+            res,
+          );
+          return;
+        }
+      }
       if (url.searchParams.has("error")) {
         res.writeHead(400).end("Authorization denied. You can close this tab.");
-        finish(new Error("OAuth: authorization denied"));
+        finish(new Error("OAuth: authorization denied"), res);
         return;
       }
       const code = url.searchParams.get("code");
@@ -384,7 +424,7 @@ function captureCode(
       res.end(
         "Authorization received. Return to your terminal for the connection result.",
       );
-      finish({ code });
+      finish({ code }, res);
     };
     const timer = setTimeout(
       () => finish(new Error("OAuth: browser consent timed out")),
@@ -395,7 +435,7 @@ function captureCode(
     listenLoopback(callback.port, handler, unavailable).then((bound) => {
       servers = bound;
       if (lifecycle.signal.aborted) {
-        for (const server of servers) server.close();
+        shut(servers);
         return;
       }
       void onReady(lifecycle.signal).catch(() =>

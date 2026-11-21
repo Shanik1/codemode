@@ -23,6 +23,7 @@ import {
 } from "../plugin/schema.js";
 import type {
   ActionContext,
+  ActionHints,
   HelpInput,
   PluginDef,
   TypedInputSchema,
@@ -136,6 +137,8 @@ interface PooledWorker {
   shape: string;
   runs: number;
   busy: boolean;
+  /** Disposed in the middle of a run: destroyed when that run ends. */
+  discard?: boolean;
 }
 
 /**
@@ -147,9 +150,10 @@ interface PooledWorker {
 function workerShape(
   pluginNames: string[],
   helpData: Record<string, HelpEntry[]>,
+  descriptions: Record<string, string>,
   memoryLimitMb: number,
 ): string {
-  const surface = JSON.stringify([pluginNames, helpData]);
+  const surface = JSON.stringify([pluginNames, helpData, descriptions]);
   // FNV-1a: no dependency, stable across processes, ample for a cache key.
   let hash = 0x811c9dc5;
   for (let i = 0; i < surface.length; i++) {
@@ -209,8 +213,7 @@ const RSS_WATCHDOG_SLACK_BYTES = 128 * 1024 * 1024;
  * Reuse is given up the moment it could be unsafe. A worker is retired on
  * timeout, crash, memory kill, plugin-surface change, leftover timers, or
  * after `maxRunsPerWorker` bodies. A run that arrives while the pooled worker
- * is busy gets its own throwaway worker, so concurrency semantics are
- * unchanged.
+ * is busy gets its own throwaway worker, so overlapping runs stay parallel.
  */
 export class ExecutionEngine {
   private registry: PluginRegistry;
@@ -235,12 +238,17 @@ export class ExecutionEngine {
       config.maxRunsPerWorker ?? DEFAULT_MAX_RUNS_PER_WORKER;
   }
 
-  /** Retire the pooled worker, if any. Safe to call repeatedly. */
+  /**
+   * Retire the pooled worker, if any. Safe to call repeatedly. A worker in
+   * the middle of a run finishes it first: destroying it there would drop
+   * the listeners that settle the run, and its caller would wait forever.
+   */
   dispose(): void {
     const entry = this.pooled;
     if (!entry) return;
     this.pooled = null;
-    destroyWorker(entry.worker);
+    if (entry.busy) entry.discard = true;
+    else destroyWorker(entry.worker);
   }
 
   /**
@@ -250,7 +258,7 @@ export class ExecutionEngine {
    * else — wrong shape, quota spent, or already busy — gets a fresh worker.
    * A worker created because the pool was occupied stays private to that run
    * (`pooled` is false) and is destroyed when the run ends, so overlapping
-   * callers keep the parallelism they had before pooling existed.
+   * callers run in parallel.
    */
   private acquire(
     shape: string,
@@ -287,7 +295,7 @@ export class ExecutionEngine {
    */
   private release(entry: PooledWorker, pooled: boolean, retire: boolean): void {
     entry.busy = false;
-    if (!pooled || retire) {
+    if (!pooled || retire || entry.discard) {
       if (this.pooled === entry) this.pooled = null;
       destroyWorker(entry.worker);
     }
@@ -316,13 +324,19 @@ export class ExecutionEngine {
     const plugins = this.registry.listPlugins();
     const pluginNames = plugins.map((p) => p.name);
     const helpData = buildHelpData(plugins);
+    const descriptions = pluginDescriptions(plugins);
     const memoryLimitMb = Math.max(
       8,
       Math.floor(memoryLimitBytes / (1024 * 1024)),
     );
     // resourceLimits are fixed at construction, so a run asking for a
     // different ceiling must not inherit an existing worker's.
-    const shape = workerShape(pluginNames, helpData, memoryLimitMb);
+    const shape = workerShape(
+      pluginNames,
+      helpData,
+      descriptions,
+      memoryLimitMb,
+    );
     const body = buildRunBody(code);
 
     let acquired: { entry: PooledWorker; pooled: boolean };
@@ -330,7 +344,7 @@ export class ExecutionEngine {
       acquired = this.acquire(
         shape,
         () =>
-          new Worker(buildWorkerSource(pluginNames, helpData), {
+          new Worker(buildWorkerSource(pluginNames, helpData, descriptions), {
             eval: true,
             // Empty by construction: without an `env` option the worker
             // inherits a copy of the host's entire environment, and
@@ -356,10 +370,15 @@ export class ExecutionEngine {
       entry.busy = true;
       entry.runs++;
 
+      // Tells every action this run called that the run is over, so remote
+      // work it still waits on is cancelled instead of left running.
+      const ended = new AbortController();
+
       let settled = false;
       const finish = (r: ExecuteResult, retire: boolean) => {
         if (settled) return;
         settled = true;
+        ended.abort();
         clearTimeout(timeoutTimer);
         clearInterval(rssTimer);
         worker.unref?.();
@@ -429,7 +448,12 @@ export class ExecutionEngine {
         if (msg.t === "log") {
           logs.push(`[${msg.level}] ${msg.line}`);
         } else if (msg.t === "invoke") {
-          this.invokeAction(msg.path, msg.args, options?.context).then(
+          this.invokeAction(
+            msg.path,
+            msg.args,
+            ended.signal,
+            options?.context,
+          ).then(
             (value) => {
               let serialized: unknown;
               try {
@@ -512,6 +536,7 @@ export class ExecutionEngine {
   private async invokeAction(
     path: string,
     rawArgs: unknown,
+    signal: AbortSignal,
     context?: unknown,
   ): Promise<unknown> {
     // A call written with no arguments reaches the action as `{}`, not
@@ -548,6 +573,7 @@ export class ExecutionEngine {
     const ctx: ActionContext = {
       connection,
       context,
+      signal,
       ...(this.hooks.credentialBroker && plugin.credential
         ? {
             credentials: this.hooks.credentialBroker({
@@ -671,10 +697,10 @@ function formatError(cause: unknown): string {
 }
 
 // ferrosearch is a Rust native addon and cannot be inlined as worker source.
-// Resolve its entry point
-// host-side and require it by absolute path inside the worker: eval'd worker
-// code gets a cwd-relative `require`, so a bare specifier would resolve
-// against the caller's cwd instead of codemode's own node_modules.
+// Resolve its entry point host-side and require it by absolute path inside
+// the worker: eval'd worker code gets a cwd-relative `require`, so a bare
+// specifier would resolve against the caller's cwd instead of codemode's own
+// node_modules.
 const ferrosearchPath = createRequire(import.meta.url).resolve(
   "@shift-labs/ferrosearch",
 );
@@ -693,6 +719,9 @@ interface HelpEntry {
   access?: "read" | "write";
   description?: string;
   inputs: Record<string, HelpInput>;
+  outputSchema?: Record<string, unknown>;
+  hints?: ActionHints;
+  sourceName?: string;
   /**
    * The action's raw typed schema, when it has one. This is what
    * `actions.check` validates against inside the worker — the same
@@ -713,10 +742,22 @@ function buildHelpData(plugins: PluginDef[]): Record<string, HelpEntry[]> {
       access: a.access,
       description: a.description,
       inputs: helpInputs(a.inputSchema),
+      ...(a.outputSchema ? { outputSchema: a.outputSchema } : {}),
+      ...(a.hints ? { hints: a.hints } : {}),
+      ...(a.sourceName !== undefined ? { sourceName: a.sourceName } : {}),
       ...(isTypedInputSchema(a.inputSchema) ? { schema: a.inputSchema } : {}),
     }));
   }
   return data;
+}
+
+/** Each described plugin's description, for `actions.plugin()`. */
+function pluginDescriptions(plugins: PluginDef[]): Record<string, string> {
+  return Object.fromEntries(
+    plugins.flatMap((p) =>
+      p.description === undefined ? [] : [[p.name, p.description]],
+    ),
+  );
 }
 
 /**
@@ -740,6 +781,7 @@ export function buildRunBody(code: string): string {
 function buildWorkerSource(
   pluginNames: string[] = [],
   helpData: Record<string, HelpEntry[]> = {},
+  descriptions: Record<string, string> = {},
 ): string {
   // Injected into every body's scope. `require` is here because bodies are
   // compiled with `new Function`, whose scope is the worker's global object.
@@ -851,6 +893,7 @@ return ${normalizeActionInput.toString()};
 })();
 
 const __help = ${JSON.stringify(helpData)};
+const __descriptions = ${JSON.stringify(descriptions)};
 
 const __makeProxy = (path = []) => new Proxy(() => undefined, {
   get(_t, prop) {
@@ -990,6 +1033,16 @@ const __actionsApi = {
     const paths = Object.keys(__index);
     return plugin ? paths.filter((p) => p.startsWith(plugin + '.')) : paths;
   },
+  plugin(name) {
+    if (!Object.prototype.hasOwnProperty.call(__help, name)) {
+      throw new Error('Unknown plugin: ' + name + '. Loaded plugins: ' + (Object.keys(__help).join(', ') || 'none') + '.');
+    }
+    return {
+      name,
+      description: __descriptions[name],
+      actions: __help[name].map((e) => name + '.' + e.action),
+    };
+  },
   describe(path) {
     const hit = __index[path];
     if (!hit) {
@@ -1005,6 +1058,9 @@ const __actionsApi = {
       description: hit.entry.description,
       signature: __formatSignature(hit.plugin, hit.entry),
       inputs: hit.entry.inputs,
+      outputSchema: hit.entry.outputSchema,
+      hints: hit.entry.hints,
+      sourceName: hit.entry.sourceName,
     };
   },
   find(query, limit = 5) {
@@ -1062,7 +1118,7 @@ const __actionsApi = {
 
 // Unknown keys (plugin names) fall through to the call proxy, so
 // actions.github.issue.create(...) keeps working alongside the explicit
-// list/find/describe/check/help helpers.
+// list/plugin/find/describe/check helpers.
 const actions = new Proxy(__actionsApi, {
   get(target, prop) {
     if (prop in target || typeof prop === 'symbol') return target[prop];
@@ -1098,9 +1154,9 @@ const __baselineGlobals = new Set(Object.getOwnPropertyNames(globalThis));
 
 // 2. Mutations to shared intrinsics (Array.prototype.push = ..., a new own
 //    property on Object, etc). NOT removable: restoring an arbitrary mutation
-//    would mean snapshotting every descriptor of every intrinsic. Instead
-//    fingerprint their own-property names and compare — a change means the
-//    body reshaped something shared and the worker must not be reused.
+//    would mean rewriting every descriptor of every intrinsic. Instead
+//    snapshot their own properties and compare — a change means the body
+//    reshaped something shared and the worker must not be reused.
 const __intrinsics = [
   Object, Object.prototype, Array, Array.prototype, Function.prototype,
   String.prototype, Number.prototype, Boolean.prototype, Promise,
