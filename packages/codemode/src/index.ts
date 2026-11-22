@@ -319,8 +319,10 @@ export type {
 } from "./utils/cli.js";
 export {
   commandExists,
+  commandPath,
   isShellError,
   killProcessTree,
+  MAX_TIMEOUT_MS,
   runShell,
   ShellError,
   syncExec,
