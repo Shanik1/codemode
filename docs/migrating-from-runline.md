@@ -77,6 +77,18 @@ Three things carry the new name from 0.46.0, with nothing to keep the old one:
 - An AWS role that codemode assumes gets the session name `codemode` by default. A policy that matches the session name `runline` needs `roleSessionName: "runline"` in the connection, or an update.
 - A few plugins identify themselves to their provider in a `User-Agent` header, which now says `codemode`.
 
+## Install the node plugin
+
+After 0.46.0 the `node` plugin is a package with one action, `node.run`, and nothing keeps the old arrangement:
+
+```bash
+codemode install npm:@shiftlabs/codemode-node
+```
+
+- Add a `node` connection again where there is one, with `codemode connection add node --plugin node`. A connection made for the bundled plugin belongs to it, and the packaged plugin refuses it.
+- The actions that each wrapped one function, such as `node.fs.readFile`, `node.path.join`, and `node.fetch`, are gone. Run a script that calls the function instead: `node.run({ command: 'console.log(require("node:fs").readFileSync("notes.txt", "utf8"))' })`.
+- `node.process.exec` and `node.process.execFile` are gone. Run commands with `bash.run` from [`codemode-bash`](../packages/codemode-bash/README.md) or `powershell.run` from [`codemode-powershell`](../packages/codemode-powershell/README.md).
+
 ## Understand what did not move
 
 `pi-runline`, the Pi extension, keeps its name and lives at [Michaelliv/pi-runline](https://github.com/Michaelliv/pi-runline). It runs runline 0.45 and reads only `.runline` folders, so keep a project's folder named `.runline` while you use the project from Pi.
