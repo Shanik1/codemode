@@ -7,9 +7,23 @@
  */
 
 import { randomBytes } from "node:crypto";
-import { createWriteStream, type WriteStream, writeFileSync } from "node:fs";
+import {
+  createWriteStream,
+  rmSync,
+  type WriteStream,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+
+/**
+ * How much of what it produces one action holds in memory and hands to the
+ * code that called it, unless the host sets another amount. Past it, an
+ * action that produces output in parts keeps the rest in a file. It guards
+ * the process, not a reader. Actions read the host's amount as
+ * `ctx.maxOutputBytes`.
+ */
+export const ACTION_MEMORY_BYTES = 8 * 1024 * 1024;
 
 /** Output can carry private data, so only the user may read the files. */
 const OUTPUT_FILE_MODE = 0o600;
@@ -45,48 +59,100 @@ export function writeOutputFile(
   return path;
 }
 
-/** Open a new output file for output that arrives in parts. */
-export function createOutputFileStream(
-  prefix: string,
-  extension: string,
-  dir?: string,
-): { path: string; stream: WriteStream } {
-  const path = outputFilePath(prefix, extension, dir);
-  return {
-    path,
-    stream: createWriteStream(path, { mode: OUTPUT_FILE_MODE, flags: "wx" }),
-  };
-}
+/** Output goes to its file in blocks of this size, not a write per part taken. */
+const BLOCK_BYTES = 64 * 1024;
 
 /**
- * The start and the end of an output around a note of what lies between,
- * cut between characters: a streaming decode holds back an unfinished
- * sequence at the end of `head`, and `tail` skips the rest of one.
+ * A new output file for output that arrives in parts. A file that cannot
+ * be created or written does not stop its writer: the parts are then
+ * dropped, and `close()` answers no path.
  */
-export function joinClipped(
-  head: Uint8Array,
-  tail: Uint8Array,
-  omittedBytes: number,
-): string {
-  let start = 0;
-  while (start < tail.length && (tail[start] & 0xc0) === 0x80) start++;
-  return `${new TextDecoder().decode(head, { stream: true })}\n\n[... ${omittedBytes} bytes omitted ...]\n\n${new TextDecoder().decode(tail.subarray(start))}`;
-}
+export class OutputFileWriter {
+  private readonly path: string;
+  private readonly stream: WriteStream;
+  private failed = false;
+  /** What the file has not been handed yet. */
+  private block: Buffer[] = [];
+  private blockBytes = 0;
 
-/** `text` within `maxBytes` of UTF-8: all of it, or its start and end. */
-export function clipText(
-  text: string,
-  maxBytes: number,
-): { text: string; truncated: boolean } {
-  const bytes = Buffer.from(text, "utf8");
-  if (bytes.length <= maxBytes) return { text, truncated: false };
-  const half = Math.floor(maxBytes / 2);
-  return {
-    text: joinClipped(
-      bytes.subarray(0, half),
-      bytes.subarray(bytes.length - (maxBytes - half)),
-      bytes.length - maxBytes,
-    ),
-    truncated: true,
-  };
+  constructor(prefix: string, extension: string, dir?: string) {
+    this.path = outputFilePath(prefix, extension, dir);
+    this.stream = createWriteStream(this.path, {
+      mode: OUTPUT_FILE_MODE,
+      flags: "wx",
+    });
+    this.stream.on("error", () => {
+      this.failed = true;
+    });
+  }
+
+  /**
+   * Take more. Answers false when the file is behind: the writer waits for
+   * `drained()` before it sends more, so that what arrives faster than the
+   * disk takes is slowed instead of held in memory.
+   */
+  write(part: Uint8Array | string): boolean {
+    if (this.failed) return true;
+    const bytes = Buffer.isBuffer(part) ? part : Buffer.from(part);
+    this.block.push(bytes);
+    this.blockBytes += bytes.length;
+    return this.blockBytes < BLOCK_BYTES || this.flush();
+  }
+
+  /** Resolves when the file has caught up, or has failed. */
+  drained(): Promise<void> {
+    const stream = this.stream;
+    return stream.writableNeedDrain && !this.failed
+      ? new Promise((resolve) => {
+          const done = () => {
+            stream.off("drain", done);
+            stream.off("error", done);
+            resolve();
+          };
+          stream.once("drain", done);
+          stream.once("error", done);
+        })
+      : Promise.resolve();
+  }
+
+  /** Finish the file and answer its path, or nothing when it failed. */
+  async close(): Promise<string | undefined> {
+    this.flush();
+    await this.end();
+    if (!this.failed) return this.path;
+    this.remove();
+    return undefined;
+  }
+
+  /** Give the file up: what it was for did not come to an end. */
+  async discard(): Promise<void> {
+    this.block = [];
+    await this.end();
+    this.remove();
+  }
+
+  private flush(): boolean {
+    const block = Buffer.concat(this.block);
+    this.block = [];
+    this.blockBytes = 0;
+    return this.failed || !block.length ? true : this.stream.write(block);
+  }
+
+  private async end(): Promise<void> {
+    const stream = this.stream;
+    // `close` follows a finished file and a failed one alike.
+    if (!stream.closed)
+      await new Promise<void>((resolve) => {
+        stream.once("close", () => resolve());
+        stream.end();
+      });
+  }
+
+  private remove(): void {
+    try {
+      rmSync(this.path, { force: true });
+    } catch {
+      // A path that cannot be reached holds no file to remove.
+    }
+  }
 }

@@ -19,6 +19,8 @@ import { afterEach, beforeEach, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import { commandExists, commandPath } from "../utils/cli.js";
 import { isShellError, runShell, type ShellProgram } from "../utils/shell.js";
+import { assertCutOf } from "./helpers/cut.js";
+import { randomText, seeded } from "./helpers/fuzz.js";
 import { ends, pidIn } from "./helpers/processes.js";
 
 const HOST = fileURLToPath(new URL("./helpers/shell-host.ts", import.meta.url));
@@ -217,6 +219,14 @@ describe("a script that does not run to its end", () => {
     for (const timeoutMs of [0, -1, Number.NaN, Number.POSITIVE_INFINITY])
       await assert.rejects(runShell(SH, "echo hi", { timeoutMs }), RangeError);
   });
+
+  it("refuses a bound on output too small to say anything in", async () => {
+    for (const maxOutputBytes of [0, 1_023, 2_000.5, Number.NaN])
+      await assert.rejects(
+        runShell(SH, "echo hi", { maxOutputBytes }),
+        RangeError,
+      );
+  });
 });
 
 describe("a command whose host ends first", () => {
@@ -249,19 +259,19 @@ describe("a command whose host ends first", () => {
   );
 });
 
-describe("output past the limit", () => {
+describe("output past what a command may hold in memory", () => {
+  const LINE = "0123456789012345678901234567890123456789";
+  const loop = (count: number) =>
+    `i=0; while [ $i -lt ${count} ]; do echo ${LINE}; i=$((i+1)); done`;
+
   posix(
-    "keeps its start and end, and all of it in a file only the user reads",
+    "keeps its last lines, and all of it in a file only the user reads",
     async () => {
-      const result = await runShell(
-        SH,
-        "echo START; i=0; while [ $i -lt 400 ]; do echo 0123456789012345678901234567890123456789; i=$((i+1)); done; echo END",
-        {
-          maxOutputBytes: 1_000,
-          outputFilePrefix: "codemode-shell-test",
-          outputDir: tmp,
-        },
-      );
+      const result = await runShell(SH, `echo START; ${loop(400)}; echo END`, {
+        maxOutputBytes: 1_024,
+        outputFilePrefix: "codemode-shell-test",
+        outputDir: tmp,
+      });
       assert.equal(result.truncated, true);
       assert.ok(result.fullOutputPath);
       assert.equal(dirname(result.fullOutputPath), tmp);
@@ -269,33 +279,50 @@ describe("output past the limit", () => {
         result.fullOutputPath,
         /codemode-shell-test-[0-9a-f]{16}\.log$/,
       );
-      assert.ok(result.output.startsWith("START\n"));
-      assert.ok(result.output.endsWith("END\n"));
       const total = 6 + 400 * 41 + 4;
-      assert.match(
-        result.output,
-        new RegExp(`\\[\\.\\.\\. ${total - 1_000} bytes omitted \\.\\.\\.\\]`),
-      );
       const full = readFileSync(result.fullOutputPath, "utf8");
       assert.equal(full.length, total);
+      // The path is part of the closing line, so how many lines fit beside
+      // it depends on where the temporary directory is.
+      const closing = new RegExp(
+        `\\nEND\\n\\n\\[Showing lines (\\d+)-402 of 402 \\(${(total / 1024).toFixed(1)}KB in all\\)\\. Full output: [^\\n]+\\]$`,
+      ).exec(result.output);
+      assert.ok(closing, result.output.slice(-200));
+      assert.ok(
+        result.output.endsWith(`Full output: ${result.fullOutputPath}]`),
+      );
+      assertCutOf(full, result.output, "a command's last lines");
+      const bytes = Buffer.byteLength(result.output);
+      assert.ok(bytes <= 1_024);
+      assert.ok(bytes + LINE.length + 1 > 1_024, "another line fits");
       assert.ok(full.startsWith("START\n") && full.endsWith("END\n"));
       assert.equal(statSync(result.fullOutputPath).mode & 0o777, 0o600);
     },
   );
 
+  posix("returns output within the bound whole", async () => {
+    const result = await runShell(SH, loop(20), { maxOutputBytes: 1_024 });
+    assert.deepEqual(
+      [result.output, result.truncated, result.fullOutputPath],
+      [`${LINE}\n`.repeat(20), false, undefined],
+    );
+  });
+
   posix(
-    "still answers its start and end where the file cannot be written",
+    "still answers its last lines where the file cannot be written",
     async () => {
       const blocked = join(tmp, "a-file");
       writeFileSync(blocked, "");
-      const result = await runShell(
-        SH,
-        "i=0; while [ $i -lt 400 ]; do echo 0123456789012345678901234567890123456789; i=$((i+1)); done; echo END",
-        { maxOutputBytes: 1_000, outputDir: blocked },
-      );
+      const result = await runShell(SH, `${loop(400)}; echo END`, {
+        maxOutputBytes: 1_024,
+        outputDir: blocked,
+      });
       assert.equal(result.truncated, true);
       assert.equal(result.fullOutputPath, undefined);
-      assert.ok(result.output.endsWith("END\n"));
+      assert.match(
+        result.output,
+        /\nEND\n\n\[Showing lines \d+-401 of 401 \(16\.0KB in all\)\.\]$/,
+      );
     },
   );
 
@@ -304,36 +331,75 @@ describe("output past the limit", () => {
     const result = await runShell(
       SH,
       `head -c ${bytes} /dev/zero | tr '\\0' a; echo; echo END`,
-      { maxOutputBytes: 1_000 },
+      { maxOutputBytes: 1_024 },
     );
     assert.ok(result.fullOutputPath);
     spilled.push(result.fullOutputPath);
     assert.equal(result.exitCode, 0);
     assert.equal(statSync(result.fullOutputPath).size, bytes + 5);
-    assert.ok(result.output.endsWith("END\n"));
+    assert.match(
+      result.output,
+      /^END\n\n\[Showing lines 2-2 of 2 \(7\.6MB in all\)\./,
+    );
   });
 
   posix("cuts between characters, not inside one", async () => {
     const result = await runShell(
       SH,
-      "i=0; while [ $i -lt 200 ]; do printf 'é'; i=$((i+1)); done",
-      { maxOutputBytes: 101 },
+      "i=0; while [ $i -lt 2000 ]; do printf 'é'; i=$((i+1)); done",
+      { maxOutputBytes: 1_025 },
     );
     if (result.fullOutputPath) spilled.push(result.fullOutputPath);
     assert.equal(result.truncated, true);
     assert.equal(result.output.includes("\uFFFD"), false);
+    // One line too long to keep whole: its end, with the closing line saying so.
+    assert.match(
+      result.output,
+      /^é+\n\n\[Showing the last \d+B of line 1 \(3\.9KB in all\)\./,
+    );
+    assert.ok(Buffer.byteLength(result.output) <= 1_025);
   });
 
   posix("carries a timed-out script's output in the same bound", async () => {
-    const failure = await runShell(
-      SH,
-      "while true; do echo 0123456789012345678901234567890123456789; done",
-      { timeoutMs: 1_000, maxOutputBytes: 500 },
-    ).catch((error) => error);
+    const failure = await runShell(SH, `while true; do echo ${LINE}; done`, {
+      timeoutMs: 1_000,
+      maxOutputBytes: 1_024,
+    }).catch((error) => error);
     assert.ok(isShellError(failure));
     if (failure.fullOutputPath) spilled.push(failure.fullOutputPath);
     assert.equal(failure.code, "timed_out");
     assert.ok(failure.fullOutputPath);
-    assert.ok(Buffer.byteLength(failure.output) < 600);
+    assert.ok(Buffer.byteLength(failure.output) <= 1_024);
+    assert.match(failure.output, /\[Showing lines \d+-\d+ of \d+ /);
   });
+
+  posix(
+    "holds for every output: within the bound, its own last lines, all of it in the file",
+    async () => {
+      const source = join(tmp, "source");
+      for (let seed = 1; seed <= 60; seed++) {
+        const random = seeded(seed);
+        const text = randomText(random, random.pick([20, 200, 2000]));
+        const maxOutputBytes = random.pick([1_024, 2_000, 20_000]);
+        writeFileSync(source, text);
+        const result = await runShell(SH, `cat ${source}`, {
+          maxOutputBytes,
+          outputDir: tmp,
+        });
+        const where = `seed ${seed}, ${maxOutputBytes} bytes`;
+        if (Buffer.byteLength(text) <= maxOutputBytes) {
+          assert.deepEqual([result.output, result.truncated], [text, false]);
+          continue;
+        }
+        assert.equal(result.truncated, true, where);
+        assert.ok(Buffer.byteLength(result.output) <= maxOutputBytes, where);
+        assert.equal(
+          readFileSync(result.fullOutputPath as string, "utf8"),
+          text,
+          where,
+        );
+        assertCutOf(text, result.output, where);
+      }
+    },
+  );
 });

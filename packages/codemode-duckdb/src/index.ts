@@ -18,13 +18,17 @@ import { join, resolve } from "node:path";
 import {
   type DuckDBConnection,
   DuckDBInstance,
+  type DuckDBResult,
   DuckDBTypeId,
 } from "@duckdb/node-api";
-import type { ActionContext, CodemodePluginAPI } from "@shiftlabs/codemode";
+import {
+  ACTION_MEMORY_BYTES,
+  type ActionContext,
+  type CodemodePluginAPI,
+  OutputFileWriter,
+} from "@shiftlabs/codemode";
 import { packageVersion } from "@shiftlabs/codemode/utils/cli";
 import * as t from "typebox";
-
-const DEFAULT_MAX_ROWS = 10_000;
 
 /** What DuckDB's client says of SQL with no statement in it. */
 const NO_STATEMENT = "Error in native callback";
@@ -65,12 +69,6 @@ const queryInput = t.Object(
           "A database from `duckdb.open`. Default: a new in-memory database that is gone when the query returns.",
       }),
     ),
-    maxRows: t.Optional(
-      t.Integer({
-        minimum: 1,
-        description: `Return at most this many rows. Default: ${DEFAULT_MAX_ROWS}.`,
-      }),
-    ),
   },
   { additionalProperties: false },
 );
@@ -81,7 +79,22 @@ type Query = Omit<t.Static<typeof queryInput>, "db">;
 interface QueryResult {
   columns: { name: string; type: string }[];
   rows: Rows;
+  totalRows: number;
   truncated: boolean;
+  fullOutputPath?: string;
+}
+
+/** How much of a result a call holds in memory, and where the rest goes. */
+interface RowsOutput {
+  maxBytes: number;
+  dir: string | undefined;
+}
+
+function rowsOutput(ctx: ActionContext): RowsOutput {
+  return {
+    maxBytes: ctx.maxOutputBytes ?? ACTION_MEMORY_BYTES,
+    dir: ctx.outputDir,
+  };
 }
 
 function quoted(identifier: string): string {
@@ -118,8 +131,8 @@ class Database {
     }
   }
 
-  query(input: Query): Promise<QueryResult> {
-    const result = this.turn.then(() => this.run(input));
+  query(input: Query, output: RowsOutput): Promise<QueryResult> {
+    const result = this.turn.then(() => this.run(input, output));
     this.turn = result.catch(() => {});
     return result;
   }
@@ -145,7 +158,7 @@ class Database {
     if (this.closing) throw new Error("duckdb: the database is closed");
   }
 
-  private async run(input: Query): Promise<QueryResult> {
+  private async run(input: Query, output: RowsOutput): Promise<QueryResult> {
     for (const [name, rows] of Object.entries(input.tables ?? {})) {
       this.stillOpen();
       await this.load(name, rows);
@@ -165,37 +178,79 @@ class Database {
     const last = await statements.prepare(statements.count - 1);
     try {
       if (input.params) last.bind(input.params);
-      const maxRows = input.maxRows ?? DEFAULT_MAX_ROWS;
-      // One row past the limit says whether there were more.
-      const reader = await last.streamAndReadUntil(maxRows + 1);
-      try {
-        const names = reader.deduplicatedColumnNames();
-        const types = reader.columnTypes();
-        const wide = types.map((type) => WIDE_INTEGERS.has(type.typeId));
-        const all = reader.getRowsJson();
-        return {
-          columns: names.map((name, index) => ({
-            name,
-            type: String(types[index]),
-          })),
-          rows: all
-            .slice(0, maxRows)
-            .map((row) =>
-              Object.fromEntries(
-                row.map((value, index) => [
-                  names[index],
-                  wide[index] ? exactNumber(value) : value,
-                ]),
-              ),
-            ),
-          truncated: all.length > maxRows,
-        };
-      } finally {
-        reader.closeSync();
-      }
+      return await this.rows(await last.stream(), output);
     } finally {
       last.destroySync();
     }
+  }
+
+  /**
+   * A result's rows: all of them while they fit in what the host lets an
+   * action hold in memory, and then the first of them, with every row in a
+   * file, a line of JSON each. The result is read to its end to write the
+   * file and to count its rows.
+   */
+  private async rows(
+    result: DuckDBResult,
+    output: RowsOutput,
+  ): Promise<QueryResult> {
+    const names = result.deduplicatedColumnNames();
+    const types = result.columnTypes();
+    const wide = types.map((type) => WIDE_INTEGERS.has(type.typeId));
+    const rows: Rows = [];
+    let keptBytes = 0;
+    let totalRows = 0;
+    let file: OutputFileWriter | undefined;
+    try {
+      for await (const part of result.yieldRowsJson()) {
+        this.stillOpen();
+        let lines = "";
+        for (const values of part) {
+          const row = Object.fromEntries(
+            values.map((value, index) => [
+              names[index],
+              wide[index] ? exactNumber(value) : value,
+            ]),
+          );
+          const line = `${JSON.stringify(row)}\n`;
+          totalRows++;
+          const size = Buffer.byteLength(line, "utf8");
+          if (file) {
+            lines += line;
+          } else if (keptBytes + size <= output.maxBytes) {
+            rows.push(row);
+            keptBytes += size;
+          } else {
+            file = new OutputFileWriter(
+              "codemode-duckdb",
+              ".jsonl",
+              output.dir,
+            );
+            // The file starts with the rows kept, then takes the rest.
+            lines =
+              rows.map((earlier) => `${JSON.stringify(earlier)}\n`).join("") +
+              line;
+          }
+        }
+        if (file && !file.write(lines)) await file.drained();
+      }
+    } catch (error) {
+      await file?.discard();
+      throw error;
+    } finally {
+      result.closeSync();
+    }
+    const fullOutputPath = await file?.close();
+    return {
+      columns: names.map((name, index) => ({
+        name,
+        type: String(types[index]),
+      })),
+      rows,
+      totalRows,
+      truncated: file !== undefined,
+      ...(fullOutputPath ? { fullOutputPath } : {}),
+    };
   }
 
   /**
@@ -294,12 +349,22 @@ const queryOutput = {
         "One object per row, keyed by column name. A 64-bit integer is a number when a number holds it exactly, else a string. A decimal is a string.",
       items: { type: "object" },
     },
+    totalRows: {
+      type: "number",
+      description: "How many rows the statement returned.",
+    },
     truncated: {
       type: "boolean",
-      description: "Whether there were more rows than `maxRows`.",
+      description:
+        "Whether `rows` is fewer than all of them: the first of a result larger than the action holds in memory.",
+    },
+    fullOutputPath: {
+      type: "string",
+      description:
+        "The file with every row, a line of JSON each, when `truncated`.",
     },
   },
-  required: ["columns", "rows", "truncated"],
+  required: ["columns", "rows", "totalRows", "truncated"],
 };
 
 export default function duckdb(rl: CodemodePluginAPI): void {
@@ -327,13 +392,14 @@ export default function duckdb(rl: CodemodePluginAPI): void {
     inputSchema: queryInput,
     outputSchema: queryOutput,
     async execute({ db, ...input }, ctx) {
-      if (db !== undefined) return database(ctx, db).query(input);
+      if (db !== undefined)
+        return database(ctx, db).query(input, rowsOutput(ctx));
       const own = await openFor(ctx);
       // A close that fails here fails the query's own promise, below.
       const stop = () => void own.close().catch(() => {});
       ctx.signal?.addEventListener("abort", stop, { once: true });
       try {
-        return await own.query(input);
+        return await own.query(input, rowsOutput(ctx));
       } finally {
         ctx.signal?.removeEventListener("abort", stop);
         await own.close();

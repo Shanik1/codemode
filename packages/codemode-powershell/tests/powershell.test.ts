@@ -6,12 +6,13 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdirSync, realpathSync, statSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { mkdirSync, realpathSync } from "node:fs";
+import { join } from "node:path";
 import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import { commandPath, type ShellResult } from "@shiftlabs/codemode/utils/cli";
 import { describePackage, pluginHarness } from "../../package-tests/harness.js";
+import { assertLargeOutputIsCutForTheRun } from "../../package-tests/shell.js";
 import powershell, {
   powershellScript,
   resolvePowerShell,
@@ -113,24 +114,12 @@ describe("powershell.run", () => {
   );
 
   withPowerShell(
-    "keeps output past the limit in the host's output directory",
-    async () => {
-      const outputDir = join(harness.tmp, "outbox");
-      const { result, error } = await codemode({}, { outputDir }).execute(
-        `return await powershell.run({ command: "[Console]::Out.Write('a' * 1500000); Write-Output END" })`,
-      );
-      assert.equal(error, undefined);
-      const found = result as ShellResult;
-      assert.equal(found.truncated, true);
-      assert.deepEqual(lines(found.output).at(-1)?.slice(-3), "END");
-      assert.ok(found.fullOutputPath);
-      assert.equal(dirname(found.fullOutputPath), outputDir);
-      assert.match(
-        found.fullOutputPath,
-        /codemode-powershell-[0-9a-f]{16}\.log$/,
-      );
-      assert.ok(statSync(found.fullOutputPath).size >= 1_500_004);
-    },
+    "hands code all of a large output, and the run its last lines",
+    () =>
+      assertLargeOutputIsCutForTheRun(
+        harness,
+        `powershell.run({ command: "[Console]::Out.Write('a' * 1500000); Write-Output END; exit 4" })`,
+      ),
   );
 
   it("refuses input that is not a command", async () => {

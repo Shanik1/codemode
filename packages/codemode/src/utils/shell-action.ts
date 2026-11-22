@@ -9,6 +9,8 @@ import { accessSync, constants } from "node:fs";
 import { resolve } from "node:path";
 import * as t from "typebox";
 import type { ActionDefinition } from "../plugin/api.js";
+import { ACTION_MEMORY_BYTES } from "./output-files.js";
+import { formatSize } from "./output-limit.js";
 import { runShell, type ShellProgram } from "./shell.js";
 import { MAX_TIMEOUT_MS } from "./timers.js";
 
@@ -53,8 +55,7 @@ const shellRunOutput = {
   properties: {
     output: {
       type: "string",
-      description:
-        "stdout and stderr together. Past 1 MiB: its start and end around a note of what was left out.",
+      description: `stdout and stderr together, all of it up to what the host lets an action hold, ${formatSize(ACTION_MEMORY_BYTES)} by default. Past that: its last lines, then a line that says which lines they are.`,
     },
     exitCode: {
       type: "number",
@@ -94,7 +95,7 @@ export function shellConnectionSchema(defaultShell: string) {
 export interface ShellRunActionOptions {
   /** The program's name as the action's description says it: `bash`, `PowerShell`, `Node.js`. */
   shell: string;
-  /** The start of the name of the file that keeps output past the limit. */
+  /** The start of the name of the file that keeps output past `ctx.maxOutputBytes`. */
   outputFilePrefix: string;
   /**
    * The program a call runs, from the one the connection names as `shell`
@@ -142,6 +143,7 @@ export function shellRunAction(
         env,
         timeoutMs,
         signal: ctx.signal,
+        maxOutputBytes: ctx.maxOutputBytes,
         outputDir: ctx.outputDir,
         outputFilePrefix: options.outputFilePrefix,
       });

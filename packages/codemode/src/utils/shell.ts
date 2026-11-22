@@ -1,8 +1,9 @@
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
-import { existsSync, type WriteStream } from "node:fs";
+import { existsSync } from "node:fs";
 import { constants as osConstants } from "node:os";
 import { join } from "node:path";
-import { createOutputFileStream, joinClipped } from "./output-files.js";
+import { ACTION_MEMORY_BYTES, OutputFileWriter } from "./output-files.js";
+import { cutText, isOutputBytes, MIN_OUTPUT_LIMIT } from "./output-limit.js";
 import { MAX_TIMEOUT_MS } from "./timers.js";
 
 /** How a shell program takes a script. */
@@ -26,9 +27,13 @@ export interface RunShellOptions {
   timeoutMs?: number;
   /** Aborting kills the command's process group and rejects the call. */
   signal?: AbortSignal;
-  /** How much output the result carries. Default: 1 MiB. */
+  /**
+   * How much output is held in memory and returned. Past it the result
+   * carries the output's last lines, and all of it is in a file. Default:
+   * `ACTION_MEMORY_BYTES`, 8 MiB.
+   */
   maxOutputBytes?: number;
-  /** The start of the name of the file that keeps output past the limit. Default: `codemode-shell`. */
+  /** The start of the name of the file that keeps output past `maxOutputBytes`. Default: `codemode-shell`. */
   outputFilePrefix?: string;
   /** Where that file is written: an action passes `ctx.outputDir`. Default: the system's temporary directory. */
   outputDir?: string;
@@ -42,7 +47,10 @@ export interface ShellResult {
   output: string;
   /** The shell's exit code. A shell ended by a signal has 128 plus the signal's number. */
   exitCode: number;
-  /** Whether `output` leaves out the middle of what the command wrote. */
+  /**
+   * Whether `output` is only the end of what the command wrote, followed by
+   * a line that says which lines it shows and where the rest is.
+   */
   truncated: boolean;
   /** The file holding everything the command wrote, when `output` does not. */
   fullOutputPath?: string;
@@ -79,37 +87,36 @@ export function isShellError(error: unknown): error is ShellError {
   );
 }
 
-const DEFAULT_MAX_OUTPUT_BYTES = 1024 * 1024;
 /** How long output may stay quiet, once the shell has exited, before the call ends. */
 const EXIT_STDIO_GRACE_MS = 100;
-/** Output goes to its file in blocks of this size, not a write per chunk read. */
-const SPILL_BLOCK_BYTES = 64 * 1024;
 
 /**
  * What a command wrote, within a bound: everything while it fits, then its
- * first and last halves in memory and the whole of it in a file.
+ * end in memory and the whole of it in a file.
  */
 class ShellOutput {
-  private readonly half: number;
-  private head: Buffer[] = [];
-  private headBytes = 0;
-  private tail: Buffer[] = [];
-  private tailBytes = 0;
+  /** The end of the output: all of it until it passes the bound, then that much and a chunk. */
+  private kept: Buffer[] = [];
+  private keptBytes = 0;
+  /** Whether `kept` starts where a line starts. */
+  private keptFromLineStart = true;
   private total = 0;
-  private path: string | undefined;
-  private file: WriteStream | undefined;
-  /** What the file has not been handed yet: it is written in blocks. */
-  private block: Buffer[] = [];
-  private blockBytes = 0;
-  /** The file could not be created or written: the output goes on without it. */
-  private fileFailed = false;
+  private lineBreaks = 0;
+  private lastByte: number | undefined;
+  /** Everything written, from the moment it passes the bound. */
+  private file: OutputFileWriter | undefined;
 
   constructor(
     private readonly maxBytes: number,
     private readonly prefix: string,
     private readonly dir: string | undefined,
-  ) {
-    this.half = Math.floor(maxBytes / 2);
+  ) {}
+
+  private get lines(): number {
+    return (
+      this.lineBreaks +
+      (this.lastByte === undefined || this.lastByte === 0x0a ? 0 : 1)
+    );
   }
 
   /**
@@ -120,104 +127,66 @@ class ShellOutput {
   append(chunk: Buffer): boolean {
     if (!chunk.length) return true;
     this.total += chunk.length;
-    let keepReading = true;
-    if (this.file) keepReading = this.write(chunk);
-    else if (this.total > this.maxBytes && !this.fileFailed) this.spill(chunk);
-    if (this.headBytes < this.half) {
-      const part = chunk.subarray(0, this.half - this.headBytes);
-      this.head.push(part);
-      this.headBytes += part.length;
-      chunk = chunk.subarray(part.length);
-      if (!chunk.length) return keepReading;
-    }
-    this.tail.push(chunk);
-    this.tailBytes += chunk.length;
-    // Whole chunks are dropped while what stays still covers the tail.
-    while (
-      this.tail.length > 1 &&
-      this.tailBytes - this.tail[0].length >= this.maxBytes - this.half
+    for (
+      let at = chunk.indexOf(0x0a);
+      at !== -1;
+      at = chunk.indexOf(0x0a, at + 1)
     )
-      this.tailBytes -= (this.tail.shift() as Buffer).length;
+      this.lineBreaks++;
+    this.lastByte = chunk[chunk.length - 1];
+    if (!this.file && this.total > this.maxBytes) {
+      this.file = new OutputFileWriter(this.prefix, ".log", this.dir);
+      for (const earlier of this.kept) this.file.write(earlier);
+    }
+    const keepReading = this.file?.write(chunk) ?? true;
+    this.kept.push(chunk);
+    this.keptBytes += chunk.length;
+    // Whole chunks are dropped while what stays is still as much as is
+    // handed back. The file starts at the bound, so it holds everything
+    // before a chunk is dropped.
+    while (
+      this.kept.length > 1 &&
+      this.keptBytes - this.kept[0].length >= this.maxBytes
+    ) {
+      const dropped = this.kept.shift() as Buffer;
+      this.keptBytes -= dropped.length;
+      this.keptFromLineStart = dropped[dropped.length - 1] === 0x0a;
+    }
     return keepReading;
   }
 
   /** Resolves when the file has caught up, or has failed. */
   drained(): Promise<void> {
-    const file = this.file;
-    return file?.writableNeedDrain && !this.fileFailed
-      ? new Promise((resolve) => {
-          const done = () => {
-            file.off("drain", done);
-            file.off("error", done);
-            resolve();
-          };
-          file.once("drain", done);
-          file.once("error", done);
-        })
-      : Promise.resolve();
-  }
-
-  private write(chunk: Buffer): boolean {
-    if (this.fileFailed) return true;
-    this.block.push(chunk);
-    this.blockBytes += chunk.length;
-    return this.blockBytes < SPILL_BLOCK_BYTES || this.flush();
-  }
-
-  private flush(): boolean {
-    const block = Buffer.concat(this.block);
-    this.block = [];
-    this.blockBytes = 0;
-    return !this.file || this.fileFailed || !block.length
-      ? true
-      : this.file.write(block);
-  }
-
-  /** Start the file with everything so far; `latest` is its last part. */
-  private spill(latest: Buffer): void {
-    try {
-      const created = createOutputFileStream(this.prefix, ".log", this.dir);
-      this.path = created.path;
-      this.file = created.stream;
-    } catch {
-      this.fileFailed = true;
-      return;
-    }
-    this.file.on("error", () => {
-      this.fileFailed = true;
-    });
-    this.block = [...this.head, ...this.tail, latest];
-    this.blockBytes = this.total;
-    this.flush();
+    return this.file?.drained() ?? Promise.resolve();
   }
 
   /** The output as text, once nothing more is appended. */
   async finish(): Promise<{ text: string; truncated: boolean; path?: string }> {
-    if (this.file) {
-      const file = this.file;
-      this.flush();
-      // `close` follows a finished file and a failed one alike.
-      if (!file.closed)
-        await new Promise<void>((resolve) => {
-          file.once("close", () => resolve());
-          file.end();
-        });
-    }
-    const head = Buffer.concat(this.head);
+    const path = await this.file?.close();
+    let end = Buffer.concat(this.kept);
     if (this.total <= this.maxBytes)
-      return {
-        text: Buffer.concat([head, ...this.tail]).toString("utf8"),
-        truncated: false,
-      };
-    const kept = this.maxBytes - this.half;
-    let tail = Buffer.concat(this.tail);
-    tail = tail.subarray(Math.max(0, tail.length - kept));
+      return { text: end.toString("utf8"), truncated: false };
+    // What is kept starts between characters and then at a line, unless
+    // that leaves nothing: the output is then the end of one long line.
+    let start = 0;
+    while (start < end.length && (end[start] & 0xc0) === 0x80) start++;
+    end = end.subarray(start);
+    const whole = end.toString("utf8");
+    const fromLine = this.keptFromLineStart
+      ? whole
+      : whole.slice(whole.indexOf("\n") + 1);
     return {
-      text: joinClipped(head, tail, this.total - head.length - tail.length),
+      text: cutText(
+        fromLine.trim() ? fromLine : whole,
+        { lines: Number.POSITIVE_INFINITY, bytes: this.maxBytes },
+        {
+          keep: "last",
+          path,
+          total: { lines: this.lines, bytes: this.total },
+        },
+      ).text,
       truncated: true,
-      ...(this.path === undefined || this.fileFailed
-        ? {}
-        : { path: this.path }),
+      ...(path ? { path } : {}),
     };
   }
 }
@@ -411,6 +380,11 @@ export async function runShell(
     throw new RangeError(
       `Invalid timeout: a number of milliseconds above 0 and at most ${MAX_TIMEOUT_MS}`,
     );
+  const maxOutputBytes = options.maxOutputBytes ?? ACTION_MEMORY_BYTES;
+  if (!isOutputBytes(maxOutputBytes))
+    throw new RangeError(
+      `Invalid maxOutputBytes: a whole number of bytes, at least ${MIN_OUTPUT_LIMIT.bytes}`,
+    );
   if (signal?.aborted) throw new ShellError("aborted", "Command aborted");
   if (options.cwd !== undefined && !existsSync(options.cwd))
     throw new ShellError(
@@ -419,7 +393,7 @@ export async function runShell(
     );
 
   const output = new ShellOutput(
-    options.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES,
+    maxOutputBytes,
     options.outputFilePrefix ?? "codemode-shell",
     options.outputDir,
   );

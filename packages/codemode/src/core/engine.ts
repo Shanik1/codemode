@@ -30,24 +30,29 @@ import type {
   TypedInputSchema,
 } from "../plugin/types.js";
 import { notifyObserver } from "../utils/observer.js";
-import { clipText, writeOutputFile } from "../utils/output-files.js";
+import { ACTION_MEMORY_BYTES } from "../utils/output-files.js";
+import {
+  isOutputBytes,
+  MIN_OUTPUT_LIMIT,
+  type OutputLimitSetting,
+  resolveOutputLimit,
+} from "../utils/output-limit.js";
 import { MAX_TIMEOUT_MS } from "../utils/timers.js";
+import { boundRun, type RunOutput } from "./run-output.js";
 
 export { MAX_TIMEOUT_MS };
 
-export interface ExecuteResult {
-  /**
-   * What the code returned. A result past `maxResultBytes` is text here:
-   * the start and the end of its JSON, or of the string it is.
-   */
-  result: unknown;
-  error?: string;
-  logs: string[];
-  /** Present when `result` is the start and end of a larger one. */
-  truncated?: true;
-  /** The file holding the whole result, when `result` does not. */
-  fullResultPath?: string;
-}
+/**
+ * How a run ended. With an output limit, which a run has unless its host
+ * sets none, `result`, `error` and `logs` are each within it:
+ *
+ * - a larger string result is its last lines;
+ * - a larger value keeps its shape when cutting strings in it to their
+ *   last lines is enough, and is otherwise text, the first lines of its
+ *   JSON;
+ * - a larger error, or longer logs, keep their last lines.
+ */
+export type ExecuteResult = RunOutput;
 
 export interface EngineOptions {
   timeoutMs?: number;
@@ -56,8 +61,10 @@ export interface EngineOptions {
   context?: unknown;
   /** Where this run's output files are written. Default: the config's `outputDir`. */
   outputDir?: string;
-  /** The most this run's result may take. Default: the config's `maxResultBytes`. */
-  maxResultBytes?: number;
+  /** How much this run hands back. Default: the config's `outputLimit`. */
+  outputLimit?: OutputLimitSetting;
+  /** How much one action may hold in memory. Default: the config's `maxActionOutputBytes`. */
+  maxActionOutputBytes?: number;
 }
 
 /**
@@ -197,40 +204,6 @@ export function shouldArmRssWatchdog(
 // Extra slack on top of the configured memory limit for the RSS watchdog,
 // since whole-process RSS includes the host's own working set.
 const RSS_WATCHDOG_SLACK_BYTES = 128 * 1024 * 1024;
-
-/**
- * A run's result within `maxBytes`: itself, or the start and end of its
- * text with the whole of it in an output file. A result that cannot be
- * written whole is still returned clipped, without a path.
- */
-function boundedResult(
-  result: unknown,
-  maxBytes: number | undefined,
-  outputDir: string | undefined,
-): Pick<ExecuteResult, "result" | "truncated" | "fullResultPath"> {
-  if (maxBytes === undefined || result === undefined || result === null)
-    return { result };
-  const isText = typeof result === "string";
-  const whole = isText ? result : JSON.stringify(result);
-  const clipped = clipText(whole, maxBytes);
-  if (!clipped.truncated) return { result };
-  let fullResultPath: string | undefined;
-  try {
-    fullResultPath = writeOutputFile(
-      "codemode-result",
-      isText ? ".txt" : ".json",
-      whole,
-      outputDir,
-    );
-  } catch {
-    // The clipped result still says that it is one.
-  }
-  return {
-    result: clipped.text,
-    truncated: true,
-    ...(fullResultPath === undefined ? {} : { fullResultPath }),
-  };
-}
 
 /**
  * Executes agent code in a node:worker_threads worker.
@@ -375,15 +348,22 @@ export class ExecutionEngine {
         logs,
       };
     }
-    const maxResultBytes =
-      options?.maxResultBytes ?? this.config.maxResultBytes;
-    if (
-      maxResultBytes !== undefined &&
-      !(Number.isSafeInteger(maxResultBytes) && maxResultBytes > 0)
-    ) {
+    let outputLimit: ReturnType<typeof resolveOutputLimit>;
+    try {
+      outputLimit = resolveOutputLimit(
+        options?.outputLimit ?? this.config.outputLimit,
+      );
+    } catch (error) {
+      return { result: null, error: (error as Error).message, logs };
+    }
+    const maxActionOutputBytes =
+      options?.maxActionOutputBytes ??
+      this.config.maxActionOutputBytes ??
+      ACTION_MEMORY_BYTES;
+    if (!isOutputBytes(maxActionOutputBytes)) {
       return {
         result: null,
-        error: `Invalid maxResultBytes: ${maxResultBytes}. Pass a whole number of bytes above 0.`,
+        error: `Invalid maxActionOutputBytes: ${maxActionOutputBytes}. Pass a whole number of bytes, at least ${MIN_OUTPUT_LIMIT.bytes}.`,
         logs,
       };
     }
@@ -460,7 +440,8 @@ export class ExecutionEngine {
         worker.off("error", onError);
         worker.off("exit", onExit);
         this.release(entry, pooled, retire);
-        resolve(r);
+        // Every way a run ends passes here, so all of them are bounded.
+        resolve(outputLimit ? boundRun(r, outputLimit, outputDir) : r);
       };
 
       // The acquire-time unref must not let the host exit mid-run: hold
@@ -527,7 +508,7 @@ export class ExecutionEngine {
             msg.args,
             ended.signal,
             options?.context,
-            outputDir,
+            { outputDir, maxOutputBytes: maxActionOutputBytes },
           ).then(
             (value) => {
               let serialized: unknown;
@@ -569,7 +550,7 @@ export class ExecutionEngine {
           finish(
             msg.ok
               ? {
-                  ...boundedResult(msg.result, maxResultBytes, outputDir),
+                  result: msg.result,
                   logs,
                 }
               : { result: null, error: msg.error ?? "Unknown error", logs },
@@ -615,8 +596,8 @@ export class ExecutionEngine {
     path: string,
     rawArgs: unknown,
     signal: AbortSignal,
-    context?: unknown,
-    outputDir?: string,
+    context: unknown,
+    output: { outputDir: string | undefined; maxOutputBytes: number },
   ): Promise<unknown> {
     // A call written with no arguments reaches the action as `{}`, not
     // `undefined`, so plugins can read `input.foo` without guarding.
@@ -653,7 +634,10 @@ export class ExecutionEngine {
       connection,
       context,
       signal,
-      ...(outputDir === undefined ? {} : { outputDir }),
+      ...(output.outputDir === undefined
+        ? {}
+        : { outputDir: output.outputDir }),
+      maxOutputBytes: output.maxOutputBytes,
       ...(this.hooks.credentialBroker && plugin.credential
         ? {
             credentials: this.hooks.credentialBroker({

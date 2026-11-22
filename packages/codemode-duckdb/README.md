@@ -34,7 +34,6 @@ const { rows } = await duckdb.query({
 | `params` | Values for the last statement's parameters: a list for `$1`, `$2`, or an object for `$name` |
 | `tables` | Rows to query, by table name. DuckDB works out each column's type from all of the values |
 | `db` | A database from `duckdb.open`. The default is a new in-memory database |
-| `maxRows` | Return at most this many rows. The default is 10,000 |
 
 Pass values in `params` instead of writing them into the SQL.
 
@@ -42,7 +41,13 @@ Pass values in `params` instead of writing them into the SQL.
 |---|---|
 | `columns` | Each column's `name` and DuckDB `type`, in order |
 | `rows` | One object per row, keyed by column name |
-| `truncated` | Whether there were more rows than `maxRows` |
+| `totalRows` | How many rows the statement returned |
+| `truncated` | Whether `rows` is fewer than all of them |
+| `fullOutputPath` | A file with every row, a line of JSON each, when `truncated` |
+
+Code gets every row up to what the host lets an action hold, [8 MiB by default](../../docs/sdk.md#limit-what-an-action-holds). A larger result is read to its end and written to a file in the host's output directory, and `rows` is then the first of them that fit.
+
+What a run returns is a separate matter: codemode cuts it to the host's [output limit](../../docs/sdk.md#limit-a-runs-result), 2,000 lines or 50 KB by default. Aggregate in SQL or pick what matters in code, and return that.
 
 Values arrive as JSON holds them:
 

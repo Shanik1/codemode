@@ -1,6 +1,7 @@
 import type { PackageManagerName } from "../packages/manager.js";
 import type { PackageEntry } from "../packages/store.js";
 import type { ConnectionConfig } from "../plugin/types.js";
+import type { OutputLimitSetting } from "../utils/output-limit.js";
 
 export interface CodemodeConfig {
   connections: ConnectionConfig[];
@@ -20,11 +21,19 @@ export interface CodemodeConfig {
    */
   outputDir?: string;
   /**
-   * The most a run's result may take, as UTF-8 text. A larger result is
-   * written whole to an output file and returned as its start and end.
-   * Default: no limit.
+   * How much a run hands back: its result, error and logs are each cut to
+   * this many lines and bytes, with the whole in an output file. Either
+   * number can be set alone, and `false` sets no limit. Default: 2000
+   * lines and 50 KB.
    */
-  maxResultBytes?: number;
+  outputLimit?: OutputLimitSetting;
+  /**
+   * How much of what it produces one action may hold in memory and hand to
+   * the code that called it. An action that produces output in parts, such
+   * as a command or a query, keeps what is past it in an output file.
+   * Default: 8 MiB.
+   */
+  maxActionOutputBytes?: number;
   /** Installed plugin packages; `PackageManager` reads and writes them. */
   packages?: PackageEntry[];
   /** What the CLI installs packages with. Read from the user's config. Default: npm. */

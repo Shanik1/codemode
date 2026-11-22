@@ -27,6 +27,7 @@ import type {
   InputSchema,
   PluginDef,
 } from "./plugin/types.js";
+import type { OutputLimitSetting } from "./utils/output-limit.js";
 
 export interface CodemodeOptions {
   plugins?: Array<PluginDef | PluginFunction>;
@@ -55,11 +56,21 @@ export interface CodemodeOptions {
    */
   outputDir?: string;
   /**
-   * The most a run's result may take, as UTF-8 text. A larger result is
-   * written whole to an output file and returned as its start and end,
-   * with `truncated` and `fullResultPath`. Default: no limit.
+   * How much a run hands back, for the sake of whoever reads it. A run's
+   * result, error and logs are each cut to this many lines and bytes,
+   * whichever comes first, with the whole in an output file. Either number
+   * can be set alone, and `false` sets no limit. Default: 2000 lines and
+   * 50 KB. Code inside a run works with whole values.
    */
-  maxResultBytes?: number;
+  outputLimit?: OutputLimitSetting;
+  /**
+   * How much of what it produces one action may hold in memory and hand to
+   * the code that called it, for the sake of the process. An action that
+   * produces output in parts, such as a command or a query, keeps what is
+   * past it in an output file, and reads this as `ctx.maxOutputBytes`.
+   * Default: 8 MiB.
+   */
+  maxActionOutputBytes?: number;
   /**
    * Observer fired in the host process for every action invocation
    * that enters a plugin's `execute()` — unknown paths and failed
@@ -78,8 +89,10 @@ export interface CodemodeExecuteOptions {
   context?: unknown;
   /** Where this run's output files are written, in place of the instance's. */
   outputDir?: string;
-  /** The most this run's result may take, in place of the instance's. */
-  maxResultBytes?: number;
+  /** How much this run hands back, in place of the instance's. */
+  outputLimit?: OutputLimitSetting;
+  /** How much one action may hold in memory during this run, in place of the instance's. */
+  maxActionOutputBytes?: number;
 }
 
 export class Codemode {
@@ -130,8 +143,11 @@ export class Codemode {
       ...(options.outputDir !== undefined
         ? { outputDir: options.outputDir }
         : {}),
-      ...(options.maxResultBytes !== undefined
-        ? { maxResultBytes: options.maxResultBytes }
+      ...(options.outputLimit !== undefined
+        ? { outputLimit: options.outputLimit }
+        : {}),
+      ...(options.maxActionOutputBytes !== undefined
+        ? { maxActionOutputBytes: options.maxActionOutputBytes }
         : {}),
     };
   }
@@ -340,7 +356,8 @@ export class Codemode {
       memoryLimitBytes: config.memoryLimitBytes,
       maxRunsPerWorker: config.maxRunsPerWorker,
       outputDir: config.outputDir,
-      maxResultBytes: config.maxResultBytes,
+      outputLimit: config.outputLimit,
+      maxActionOutputBytes: config.maxActionOutputBytes,
     });
 
     for (const plugin of plugins) {
